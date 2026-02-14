@@ -10,6 +10,8 @@ from torchvision.transforms.functional import to_tensor, to_pil_image
 import os
 from PIL import Image
 import argparse
+import subprocess
+from tqdm import tqdm
 
 from genstereo import GenStereo, AdaptiveFusionLayer
 
@@ -60,13 +62,9 @@ def get_upsampler(scale=4):
     if not REALESRGAN_AVAILABLE:
         raise ImportError(
             "Real-ESRGAN not installed. Install with:\n"
-            "  pip install basicsr realesrgan\n"
-            "Or for faster installation:\n"
-            "  pip install basicsr\n"
-            "  pip install git+https://github.com/xinntao/Real-ESRGAN.git"
+            "  pip install basicsr realesrgan"
         )
     
-    # Model paths
     esrgan_dir = 'checkpoints/esrgan'
     os.makedirs(esrgan_dir, exist_ok=True)
     
@@ -74,64 +72,102 @@ def get_upsampler(scale=4):
         model_name = 'RealESRGAN_x2plus'
         model_url = 'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth'
         model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=2)
-    else:  # scale 4
+    else:
         model_name = 'RealESRGAN_x4plus'
         model_url = 'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth'
         model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
     
     model_path = join(esrgan_dir, f'{model_name}.pth')
     
-    # Download model if not exists
     if not os.path.exists(model_path):
         print(f"Downloading Real-ESRGAN model: {model_name}...")
         import urllib.request
         urllib.request.urlretrieve(model_url, model_path)
         print(f"Downloaded to: {model_path}")
     
-    # Determine device for upscaler
     upscaler_device = DEVICE
     if DEVICE == 'mps':
-        # Real-ESRGAN may have issues with MPS, fall back to CPU on Mac if needed
         upscaler_device = 'cpu'
     
     _upsampler = RealESRGANer(
         scale=scale,
         model_path=model_path,
         model=model,
-        tile=0,  # 0 = no tiling, use full image (may need more VRAM)
+        tile=0,
         tile_pad=10,
         pre_pad=0,
-        half=False,  # Use float32 for better compatibility
+        half=False,
         device=upscaler_device
     )
     
     return _upsampler
 
-def upscale_image(img, scale=4):
-    """Upscale image using Real-ESRGAN.
-    
-    Args:
-        img: PIL Image or numpy array (BGR)
-        scale: Upscaling factor (2 or 4)
-    
-    Returns:
-        PIL Image (upscaled)
-    """
+def upscale_frame(img, scale=4):
+    """Upscale a single frame using Real-ESRGAN."""
     upsampler = get_upsampler(scale)
     
-    # Convert PIL to numpy BGR if needed
     if isinstance(img, Image.Image):
         img_np = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
     else:
         img_np = img
     
-    # Upscale
     output, _ = upsampler.enhance(img_np, outscale=scale)
+    return cv2.cvtColor(output, cv2.COLOR_BGR2RGB)
+
+def check_ffmpeg():
+    """Check if FFmpeg is available."""
+    try:
+        subprocess.run(['ffmpeg', '-version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except FileNotFoundError:
+        return False
+
+class FFmpegVideoWriter:
+    """Video writer using FFmpeg with H.264 codec."""
     
-    # Convert back to PIL
-    output_pil = Image.fromarray(cv2.cvtColor(output, cv2.COLOR_BGR2RGB))
+    def __init__(self, output_path, width, height, fps, crf=23, preset='medium'):
+        self.output_path = output_path
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.crf = crf
+        self.preset = preset
+        self.process = None
+        self._start_process()
     
-    return output_pil
+    def _start_process(self):
+        cmd = [
+            'ffmpeg', '-y',
+            '-f', 'rawvideo',
+            '-s', f'{self.width}x{self.height}',
+            '-pix_fmt', 'rgb24',
+            '-r', str(self.fps),
+            '-i', 'pipe:',
+            '-c:v', 'libx264',
+            '-crf', str(self.crf),
+            '-preset', self.preset,
+            '-pix_fmt', 'yuv420p',
+            self.output_path
+        ]
+        
+        self.process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE
+        )
+    
+    def write(self, frame):
+        """Write RGB frame (numpy array) to video."""
+        if frame.shape[1] != self.width or frame.shape[0] != self.height:
+            raise ValueError(f"Frame size mismatch. Expected {self.width}x{self.height}")
+        self.process.stdin.write(frame.tobytes())
+    
+    def close(self):
+        """Finalize video."""
+        if self.process:
+            self.process.stdin.close()
+            self.process.wait()
 
 def calculate_output_size(original_size: tuple, max_size: int) -> tuple:
     """Calculate output size keeping aspect ratio."""
@@ -144,33 +180,12 @@ def calculate_output_size(original_size: tuple, max_size: int) -> tuple:
         new_height = max_size
         new_width = int(W * (max_size / H))
     
-    # Ensure dimensions are divisible by 8
     new_width = (new_width // 8) * 8
     new_height = (new_height // 8) * 8
-    
-    # Ensure minimum size
     new_width = max(new_width, 64)
     new_height = max(new_height, 64)
     
     return (new_width, new_height)
-
-def load_image_and_depth(image_path: str, depth_path: str):
-    """Load image and depth map. Returns (processed_image, depth_tensor, original_size, output_size)."""
-    image = Image.open(image_path).convert('RGB')
-    original_size = image.size  # (W, H)
-    
-    output_size = calculate_output_size(original_size, IMAGE_SIZE)
-    
-    # Resize to square for model processing
-    square_image = image.resize((IMAGE_SIZE, IMAGE_SIZE), Image.BILINEAR)
-    
-    # Load and resize depth map
-    depth_map = Image.open(depth_path).convert('L')
-    depth_map = depth_map.resize((IMAGE_SIZE, IMAGE_SIZE), Image.BILINEAR)
-    
-    depth_tensor = to_tensor(depth_map).unsqueeze(0).float().to(DEVICE)
-    
-    return square_image, depth_tensor, original_size, output_size
 
 def normalize_disp(disp):
     return (disp - disp.min()) / (disp.max() - disp.min())
@@ -181,65 +196,169 @@ def morphological_opening(mask_tensor, kernel_size=7):
     cleaned_mask_np = cv2.morphologyEx(mask_np, cv2.MORPH_OPEN, kernel)
     return torch.tensor(cleaned_mask_np, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(DEVICE)
 
-def generate_novel_view(image, depth, output_dir, basename, original_size, output_size, scale_factor=0.05, save_all=False, upscale=0):
-    """Generate novel view and save outputs."""
-    output_path = join(output_dir, basename)
-    os.makedirs(output_path, exist_ok=True)
-
-    disparity = normalize_disp(depth) * scale_factor * IMAGE_SIZE
-
-    renders = genstereo_nvs(src_image=image, src_disparity=disparity, ratio=None)
+def process_frame(image_pil, depth_tensor, scale_factor=0.05):
+    """Process a single frame and return left and right images as numpy arrays (RGB)."""
+    
+    # Prepare disparity
+    disparity = normalize_disp(depth_tensor) * scale_factor * IMAGE_SIZE
+    
+    # Generate novel view
+    renders = genstereo_nvs(src_image=image_pil, src_disparity=disparity, ratio=None)
     warped = (renders['warped'] + 1) / 2
     mask = morphological_opening(renders['mask'])
     
     with torch.no_grad():
         fusion_image = fusion_model(renders['synthesized'].float(), warped.float(), mask.float())
     
-    # Resize outputs to target output size (restoring aspect ratio)
+    # Convert to numpy RGB
+    left_np = np.array(image_pil)
+    right_np = np.array(to_pil_image(fusion_image[0]))
+    
+    return left_np, right_np
+
+def process_video(video_path, depth_video_path, output_dir, scale_factor=0.05, upscale=0, save_all=False, crf=23, preset='medium'):
+    """Process video frame by frame and save output videos."""
+    
+    if not check_ffmpeg():
+        print("[ERROR] FFmpeg not found!")
+        print("  Windows: choco install ffmpeg  OR  download from https://ffmpeg.org")
+        print("  macOS:   brew install ffmpeg")
+        return
+    
+    base_name = splitext(basename(video_path))[0]
+    output_path = join(output_dir, base_name)
+    os.makedirs(output_path, exist_ok=True)
+    
+    # Open input video
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open video: {video_path}")
+    
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    # Open depth video
+    depth_cap = cv2.VideoCapture(depth_video_path)
+    if not depth_cap.isOpened():
+        raise RuntimeError(f"Failed to open depth video: {depth_video_path}")
+    
+    depth_total = int(depth_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    # Calculate output size
+    output_size = calculate_output_size((width, height), IMAGE_SIZE)
     out_w, out_h = output_size
-    fusion_image_pil = to_pil_image(fusion_image[0])
-    fusion_image_pil = fusion_image_pil.resize((out_w, out_h), Image.BILINEAR)
     
-    # Load original image and resize to output size
-    original_image = image.resize((out_w, out_h), Image.BILINEAR)
-    
-    # Apply upscaling if requested
+    # Apply upscale factor
     if upscale > 0:
-        print(f"Upscaling images {upscale}x...")
-        original_image = upscale_image(original_image, upscale)
-        fusion_image_pil = upscale_image(fusion_image_pil, upscale)
-        out_w, out_h = original_image.size
+        final_w = out_w * upscale
+        final_h = out_h * upscale
+    else:
+        final_w, final_h = out_w, out_h
     
-    # Save standard outputs (left.png and generated_right.png)
-    original_image.save(join(output_path, 'left.png'))
-    fusion_image_pil.save(join(output_path, 'generated_right.png'))
+    print(f"Input video:   {width}x{height} @ {fps:.2f}fps, {total_frames} frames")
+    print(f"Depth video:   {depth_total} frames")
+    print(f"Output size:   {final_w}x{final_h}")
+    print(f"CRF:           {crf}, Preset: {preset}")
+    print("")
     
-    # Save additional outputs if requested
+    # Initialize video writers
+    left_writer = FFmpegVideoWriter(join(output_path, 'left.mp4'), final_w, final_h, fps, crf, preset)
+    right_writer = FFmpegVideoWriter(join(output_path, 'right.mp4'), final_w, final_h, fps, crf, preset)
+    
     if save_all:
-        warped_pil = to_pil_image(warped[0])
-        warped_pil = warped_pil.resize((out_w // upscale if upscale > 0 else out_w, out_h // upscale if upscale > 0 else out_h), Image.BILINEAR)
-        
-        depth_np = depth.squeeze().cpu().numpy()
-        disp_vis = cv2.applyColorMap((normalize_disp(depth_np) * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
-        disp_vis = cv2.resize(disp_vis, (out_w // upscale if upscale > 0 else out_w, out_h // upscale if upscale > 0 else out_h))
-        
-        if upscale > 0:
-            warped_pil = upscale_image(warped_pil, upscale)
-            disp_vis, _ = get_upsampler(upscale).enhance(disp_vis, outscale=upscale)
-        
-        cv2.imwrite(join(output_path, 'disp.png'), disp_vis)
-        warped_pil.save(join(output_path, 'warped.png'))
+        disp_writer = FFmpegVideoWriter(join(output_path, 'disp.mp4'), final_w, final_h, fps, crf, preset)
+        warped_writer = FFmpegVideoWriter(join(output_path, 'warped.mp4'), final_w, final_h, fps, crf, preset)
     
-    return (out_w, out_h)
+    frame_idx = 0
+    pbar = tqdm(total=total_frames, unit='frame', desc='Processing')
+    
+    try:
+        while True:
+            ret, frame_bgr = cap.read()
+            if not ret:
+                break
+            
+            # Read depth frame
+            ret_depth, depth_frame_bgr = depth_cap.read()
+            if not ret_depth:
+                print(f"\n[WARNING] Depth video ended at frame {frame_idx}")
+                break
+            
+            # Convert depth frame to grayscale and resize
+            depth_gray = cv2.cvtColor(depth_frame_bgr, cv2.COLOR_BGR2GRAY)
+            depth_pil = Image.fromarray(depth_gray).resize((IMAGE_SIZE, IMAGE_SIZE), Image.BILINEAR)
+            depth_tensor = to_tensor(depth_pil).unsqueeze(0).float().to(DEVICE)
+            
+            # Convert frame to RGB and resize to square for model
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            frame_pil = Image.fromarray(frame_rgb).resize((IMAGE_SIZE, IMAGE_SIZE), Image.BILINEAR)
+            
+            # Process frame
+            left_np, right_np = process_frame(frame_pil, depth_tensor, scale_factor)
+            
+            # Resize to output size
+            left_np = cv2.resize(left_np, (out_w, out_h))
+            right_np = cv2.resize(right_np, (out_w, out_h))
+            
+            # Upscale if requested
+            if upscale > 0:
+                left_np = upscale_frame(left_np, upscale)
+                right_np = upscale_frame(right_np, upscale)
+            
+            # Write frames
+            left_writer.write(left_np)
+            right_writer.write(right_np)
+            
+            if save_all:
+                # Disparity visualization
+                depth_vis = cv2.applyColorMap(depth_gray, cv2.COLORMAP_INFERNO)
+                depth_vis = cv2.resize(depth_vis, (out_w, out_h))
+                if upscale > 0:
+                    depth_vis = upscale_frame(depth_vis, upscale)
+                    depth_vis = cv2.cvtColor(depth_vis, cv2.COLOR_RGB2BGR)
+                disp_writer.write(cv2.cvtColor(depth_vis, cv2.COLOR_BGR2RGB))
+                
+                # Warped image (simplified - just use right as placeholder)
+                warped_np = cv2.resize(np.array(to_pil_image((renders['warped'][0] + 1) / 2)), (out_w, out_h))
+                if upscale > 0:
+                    warped_np = upscale_frame(warped_np, upscale)
+                warped_writer.write(warped_np)
+            
+            frame_idx += 1
+            pbar.update(1)
+        
+        pbar.close()
+    
+    finally:
+        cap.release()
+        depth_cap.release()
+        left_writer.close()
+        right_writer.close()
+        if save_all:
+            disp_writer.close()
+            warped_writer.close()
+    
+    print(f"\nDone! Processed {frame_idx} frames")
+    print(f"Output directory: {output_path}/")
+    print(f"  - left.mp4")
+    print(f"  - right.mp4")
+    if save_all:
+        print(f"  - disp.mp4")
+        print(f"  - warped.mp4")
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Generate novel view from input image with depth map")
-    parser.add_argument("image_path", help="Path to input image")
-    parser.add_argument("depth_path", help="Path to depth map (grayscale image)")
+    parser = argparse.ArgumentParser(description="Generate stereo video from input video with depth map")
+    parser.add_argument("video_path", help="Path to input video")
+    parser.add_argument("depth_video_path", help="Path to depth video (grayscale)")
     parser.add_argument("--output", default="./vis", help="Output directory")
     parser.add_argument("--scale_factor", type=float, default=0.05, help="Disparity scaling factor")
-    parser.add_argument("--save_all", action='store_true', help="Save all outputs (disp.png, warped.png) in addition to left.png and generated_right.png")
-    parser.add_argument("--upscale", type=int, choices=[0, 2, 4], default=0, help="Upscale output images by factor (0=no upscaling, 2=2x, 4=4x). Requires: pip install basicsr realesrgan")
+    parser.add_argument("--save_all", action='store_true', help="Save all outputs (disp.mp4, warped.mp4) in addition to left.mp4 and right.mp4")
+    parser.add_argument("--upscale", type=int, choices=[0, 2, 4], default=0, help="Upscale output videos by factor (0=no upscaling, 2=2x, 4=4x)")
+    parser.add_argument("--crf", type=int, default=23, help="H.264 quality (0-51, lower=better, 18-28 recommended)")
+    parser.add_argument("--preset", default='medium', help="Encoding speed (ultrafast, fast, medium, slow)")
+    
     args = parser.parse_args()
     
     print(f"SD Version: {SD_VERSION}")
@@ -255,24 +374,13 @@ if __name__ == '__main__':
             print(f"Upscaling: {args.upscale}x (Real-ESRGAN)")
     print("")
     
-    base_name = splitext(basename(args.image_path))[0]
-    
-    print(f"Loading image from {args.image_path}")
-    print(f"Loading depth map from {args.depth_path}")
-    img, depth, orig_size, out_size = load_image_and_depth(args.image_path, args.depth_path)
-    
-    print(f"Original size: {orig_size[0]}x{orig_size[1]} px")
-    print(f"Output width:  {out_size[0]} px")
-    print(f"Output height: {out_size[1]} px")
-    print(f"Scale factor:  {args.scale_factor}")
-    print("")
-    
-    final_size = generate_novel_view(img, depth, args.output, base_name, orig_size, out_size, args.scale_factor, args.save_all, args.upscale)
-    
-    saved_files = "left.png, generated_right.png"
-    if args.save_all:
-        saved_files += ", disp.png, warped.png"
-    print(f"Done! Saved: {saved_files}")
-    if args.upscale > 0:
-        print(f"Final size:   {final_size[0]}x{final_size[1]} px (upscaled {args.upscale}x)")
-    print(f"Output directory: {join(args.output, base_name)}/")
+    process_video(
+        args.video_path,
+        args.depth_video_path,
+        args.output,
+        scale_factor=args.scale_factor,
+        upscale=args.upscale,
+        save_all=args.save_all,
+        crf=args.crf,
+        preset=args.preset
+    )
