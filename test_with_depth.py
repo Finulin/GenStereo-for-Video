@@ -12,6 +12,7 @@ from PIL import Image
 import argparse
 import subprocess
 from tqdm import tqdm
+import gc
 
 from genstereo import GenStereo, AdaptiveFusionLayer
 
@@ -51,19 +52,17 @@ fusion_model = fusion_model.to(DEVICE).eval()
 
 # Real-ESRGAN upscaler (lazy initialization)
 _upsampler = None
+_upsampler_scale = None
 
 def get_upsampler(scale=4):
     """Initialize and return Real-ESRGAN upsampler."""
-    global _upsampler
+    global _upsampler, _upsampler_scale
     
-    if _upsampler is not None:
+    if _upsampler is not None and _upsampler_scale == scale:
         return _upsampler
     
     if not REALESRGAN_AVAILABLE:
-        raise ImportError(
-            "Real-ESRGAN not installed. Install with:\n"
-            "  pip install basicsr realesrgan"
-        )
+        raise ImportError("Real-ESRGAN not installed. Install with: pip install basicsr realesrgan")
     
     esrgan_dir = 'checkpoints/esrgan'
     os.makedirs(esrgan_dir, exist_ok=True)
@@ -93,12 +92,13 @@ def get_upsampler(scale=4):
         scale=scale,
         model_path=model_path,
         model=model,
-        tile=0,
+        tile=512,          # Use tiling to reduce VRAM
         tile_pad=10,
         pre_pad=0,
         half=False,
         device=upscaler_device
     )
+    _upsampler_scale = scale
     
     return _upsampler
 
@@ -121,6 +121,14 @@ def check_ffmpeg():
         return True
     except FileNotFoundError:
         return False
+
+def get_cuda_memory_info():
+    """Get CUDA memory usage info."""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        return f"VRAM: {allocated:.2f}GB used, {reserved:.2f}GB reserved"
+    return ""
 
 class FFmpegVideoWriter:
     """Video writer using FFmpeg with H.264 codec."""
@@ -147,6 +155,7 @@ class FFmpegVideoWriter:
             '-crf', str(self.crf),
             '-preset', self.preset,
             '-pix_fmt', 'yuv420p',
+            '-loglevel', 'error',
             self.output_path
         ]
         
@@ -154,20 +163,32 @@ class FFmpegVideoWriter:
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE
+            stderr=subprocess.PIPE,
+            bufsize=10**8  # Large buffer
         )
     
     def write(self, frame):
         """Write RGB frame (numpy array) to video."""
         if frame.shape[1] != self.width or frame.shape[0] != self.height:
             raise ValueError(f"Frame size mismatch. Expected {self.width}x{self.height}")
-        self.process.stdin.write(frame.tobytes())
+        try:
+            self.process.stdin.write(frame.tobytes())
+            self.process.stdin.flush()  # Force flush after each frame
+        except BrokenPipeError:
+            stderr = self.process.stderr.read().decode()
+            raise RuntimeError(f"FFmpeg error: {stderr}")
     
     def close(self):
         """Finalize video."""
         if self.process:
-            self.process.stdin.close()
-            self.process.wait()
+            try:
+                self.process.stdin.close()
+                self.process.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                print("[WARNING] FFmpeg process killed (timeout)")
+            except Exception as e:
+                print(f"[WARNING] FFmpeg close error: {e}")
 
 def calculate_output_size(original_size: tuple, max_size: int) -> tuple:
     """Calculate output size keeping aspect ratio."""
@@ -196,18 +217,25 @@ def morphological_opening(mask_tensor, kernel_size=7):
     cleaned_mask_np = cv2.morphologyEx(mask_np, cv2.MORPH_OPEN, kernel)
     return torch.tensor(cleaned_mask_np, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(DEVICE)
 
-def process_frame(image_pil, depth_tensor, scale_factor=0.05):
+def clear_memory():
+    """Clear GPU and system memory."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+def process_frame(image_pil, depth_tensor, convergence=0.02):
     """Process a single frame and return left and right images as numpy arrays (RGB)."""
     
     # Prepare disparity
-    disparity = normalize_disp(depth_tensor) * scale_factor * IMAGE_SIZE
+    disparity = normalize_disp(depth_tensor) * convergence * IMAGE_SIZE
     
     # Generate novel view
     renders = genstereo_nvs(src_image=image_pil, src_disparity=disparity, ratio=None)
     warped = (renders['warped'] + 1) / 2
     mask = morphological_opening(renders['mask'])
     
-    with torch.no_grad():
+    with torch.inference_mode():
         fusion_image = fusion_model(renders['synthesized'].float(), warped.float(), mask.float())
     
     # Convert to numpy RGB
@@ -216,8 +244,12 @@ def process_frame(image_pil, depth_tensor, scale_factor=0.05):
     
     return left_np, right_np
 
-def process_video(video_path, depth_video_path, output_dir, scale_factor=0.05, upscale=0, save_all=False, crf=23, preset='medium'):
-    """Process video frame by frame and save output videos."""
+def process_video(video_path, depth_video_path, output_dir, convergence=0.02, upscale=2, save_all=False, crf=23, preset='medium', clear_every=10):
+    """Process video frame by frame and save output videos.
+    
+    Args:
+        clear_every: Clear memory every N frames to prevent memory buildup
+    """
     
     if not check_ffmpeg():
         print("[ERROR] FFmpeg not found!")
@@ -261,6 +293,7 @@ def process_video(video_path, depth_video_path, output_dir, scale_factor=0.05, u
     print(f"Depth video:   {depth_total} frames")
     print(f"Output size:   {final_w}x{final_h}")
     print(f"CRF:           {crf}, Preset: {preset}")
+    print(f"Clear memory:  Every {clear_every} frames")
     print("")
     
     # Initialize video writers
@@ -296,7 +329,7 @@ def process_video(video_path, depth_video_path, output_dir, scale_factor=0.05, u
             frame_pil = Image.fromarray(frame_rgb).resize((IMAGE_SIZE, IMAGE_SIZE), Image.BILINEAR)
             
             # Process frame
-            left_np, right_np = process_frame(frame_pil, depth_tensor, scale_factor)
+            left_np, right_np = process_frame(frame_pil, depth_tensor, convergence)
             
             # Resize to output size
             left_np = cv2.resize(left_np, (out_w, out_h))
@@ -312,7 +345,6 @@ def process_video(video_path, depth_video_path, output_dir, scale_factor=0.05, u
             right_writer.write(right_np)
             
             if save_all:
-                # Disparity visualization
                 depth_vis = cv2.applyColorMap(depth_gray, cv2.COLORMAP_INFERNO)
                 depth_vis = cv2.resize(depth_vis, (out_w, out_h))
                 if upscale > 0:
@@ -320,7 +352,6 @@ def process_video(video_path, depth_video_path, output_dir, scale_factor=0.05, u
                     depth_vis = cv2.cvtColor(depth_vis, cv2.COLOR_RGB2BGR)
                 disp_writer.write(cv2.cvtColor(depth_vis, cv2.COLOR_BGR2RGB))
                 
-                # Warped image (simplified - just use right as placeholder)
                 warped_np = cv2.resize(np.array(to_pil_image((renders['warped'][0] + 1) / 2)), (out_w, out_h))
                 if upscale > 0:
                     warped_np = upscale_frame(warped_np, upscale)
@@ -328,8 +359,18 @@ def process_video(video_path, depth_video_path, output_dir, scale_factor=0.05, u
             
             frame_idx += 1
             pbar.update(1)
+            
+            # Periodic memory cleanup
+            if frame_idx % clear_every == 0:
+                clear_memory()
+                if torch.cuda.is_available() and frame_idx % 50 == 0:
+                    mem_info = get_cuda_memory_info()
+                    pbar.set_postfix_str(mem_info)
         
         pbar.close()
+    
+    except KeyboardInterrupt:
+        print("\n[INFO] Interrupted by user")
     
     finally:
         cap.release()
@@ -339,6 +380,7 @@ def process_video(video_path, depth_video_path, output_dir, scale_factor=0.05, u
         if save_all:
             disp_writer.close()
             warped_writer.close()
+        clear_memory()
     
     print(f"\nDone! Processed {frame_idx} frames")
     print(f"Output directory: {output_path}/")
@@ -353,11 +395,12 @@ if __name__ == '__main__':
     parser.add_argument("video_path", help="Path to input video")
     parser.add_argument("depth_video_path", help="Path to depth video (grayscale)")
     parser.add_argument("--output", default="./vis", help="Output directory")
-    parser.add_argument("--scale_factor", type=float, default=0.05, help="Disparity scaling factor")
+    parser.add_argument("--convergence", type=float, default=0.02, help="Convergence factor for stereo depth")
     parser.add_argument("--save_all", action='store_true', help="Save all outputs (disp.mp4, warped.mp4) in addition to left.mp4 and right.mp4")
-    parser.add_argument("--upscale", type=int, choices=[0, 2, 4], default=0, help="Upscale output videos by factor (0=no upscaling, 2=2x, 4=4x)")
+    parser.add_argument("--upscale", type=int, choices=[0, 2, 4], default=2, help="Upscale output videos by factor (0=no upscaling, 2=2x, 4=4x)")
     parser.add_argument("--crf", type=int, default=23, help="H.264 quality (0-51, lower=better, 18-28 recommended)")
     parser.add_argument("--preset", default='medium', help="Encoding speed (ultrafast, fast, medium, slow)")
+    parser.add_argument("--clear_every", type=int, default=10, help="Clear memory every N frames")
     
     args = parser.parse_args()
     
@@ -378,9 +421,10 @@ if __name__ == '__main__':
         args.video_path,
         args.depth_video_path,
         args.output,
-        scale_factor=args.scale_factor,
+        convergence=args.convergence,
         upscale=args.upscale,
         save_all=args.save_all,
         crf=args.crf,
-        preset=args.preset
+        preset=args.preset,
+        clear_every=args.clear_every
     )
