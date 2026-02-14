@@ -103,15 +103,28 @@ def get_upsampler(scale=4):
     return _upsampler
 
 def upscale_frame(img, scale=4):
-    """Upscale a single frame using Real-ESRGAN."""
+    """Upscale a single frame using Real-ESRGAN.
+    
+    Args:
+        img: PIL Image or numpy array (RGB format)
+        scale: Upscaling factor
+    
+    Returns:
+        numpy array (RGB format)
+    """
     upsampler = get_upsampler(scale)
     
+    # Convert to BGR for Real-ESRGAN (expects BGR)
     if isinstance(img, Image.Image):
         img_np = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
     else:
-        img_np = img
+        # numpy array - assume RGB and convert to BGR
+        img_np = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
     
+    # Upscale (Real-ESRGAN returns BGR)
     output, _ = upsampler.enhance(img_np, outscale=scale)
+    
+    # Convert back to RGB
     return cv2.cvtColor(output, cv2.COLOR_BGR2RGB)
 
 def check_ffmpeg():
@@ -131,7 +144,7 @@ def get_cuda_memory_info():
     return ""
 
 class FFmpegVideoWriter:
-    """Video writer using FFmpeg with H.264 codec."""
+    """Video writer using FFmpeg with H.264 codec and BT.709 colorspace."""
     
     def __init__(self, output_path, width, height, fps, crf=23, preset='medium'):
         self.output_path = output_path
@@ -149,12 +162,18 @@ class FFmpegVideoWriter:
             '-f', 'rawvideo',
             '-s', f'{self.width}x{self.height}',
             '-pix_fmt', 'rgb24',
+            '-colorspace', 'bt709',
+            '-color_primaries', 'bt709',
+            '-color_trc', 'bt709',
             '-r', str(self.fps),
             '-i', 'pipe:',
             '-c:v', 'libx264',
             '-crf', str(self.crf),
             '-preset', self.preset,
             '-pix_fmt', 'yuv420p',
+            '-colorspace', 'bt709',
+            '-color_primaries', 'bt709',
+            '-color_trc', 'bt709',
             '-loglevel', 'error',
             self.output_path
         ]
@@ -345,13 +364,16 @@ def process_video(video_path, depth_video_path, output_dir, convergence=0.02, up
             right_writer.write(right_np)
             
             if save_all:
+                # Depth visualization (cv2.applyColorMap returns BGR)
                 depth_vis = cv2.applyColorMap(depth_gray, cv2.COLORMAP_INFERNO)
                 depth_vis = cv2.resize(depth_vis, (out_w, out_h))
+                # Convert BGR to RGB for upscaling
+                depth_vis_rgb = cv2.cvtColor(depth_vis, cv2.COLOR_BGR2RGB)
                 if upscale > 0:
-                    depth_vis = upscale_frame(depth_vis, upscale)
-                    depth_vis = cv2.cvtColor(depth_vis, cv2.COLOR_RGB2BGR)
-                disp_writer.write(cv2.cvtColor(depth_vis, cv2.COLOR_BGR2RGB))
+                    depth_vis_rgb = upscale_frame(depth_vis_rgb, upscale)
+                disp_writer.write(depth_vis_rgb)
                 
+                # Warped image (already RGB from PIL)
                 warped_np = cv2.resize(np.array(to_pil_image((renders['warped'][0] + 1) / 2)), (out_w, out_h))
                 if upscale > 0:
                     warped_np = upscale_frame(warped_np, upscale)
