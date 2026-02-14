@@ -1,3 +1,7 @@
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", module="diffusers")
+
 from os.path import basename, splitext, join
 import numpy as np
 import torch
@@ -60,7 +64,7 @@ genstereo_nvs = GenStereo(cfg=genstereo_cfg, device=DEVICE, sd_version=SD_VERSIO
 
 fusion_model = AdaptiveFusionLayer()
 fusion_checkpoint = join(checkpoint_dir, CHECKPOINT_NAME, 'fusion_layer.pth')
-fusion_model.load_state_dict(torch.load(fusion_checkpoint))
+fusion_model.load_state_dict(torch.load(fusion_checkpoint, map_location=DEVICE))
 fusion_model = fusion_model.to(DEVICE).eval()
 
 def crop(img: Image) -> Image:

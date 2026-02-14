@@ -1,3 +1,7 @@
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", module="diffusers")
+
 from os.path import basename, splitext, join
 import numpy as np
 import torch
@@ -63,7 +67,7 @@ genstereo_nvs = GenStereo(cfg=genstereo_cfg, device=DEVICE, sd_version=SD_VERSIO
 
 fusion_model = AdaptiveFusionLayer()
 fusion_checkpoint = join(checkpoint_dir, CHECKPOINT_NAME, 'fusion_layer.pth')
-fusion_model.load_state_dict(torch.load(fusion_checkpoint))
+fusion_model.load_state_dict(torch.load(fusion_checkpoint, map_location=DEVICE))
 fusion_model = fusion_model.to(DEVICE).eval()
 
 def crop(img: Image) -> Image:
@@ -118,7 +122,6 @@ def process_frame(image_pil: Image, depth: torch.Tensor, scale_factor=0.15):
     with torch.no_grad():
         fusion_image = fusion_model(renders['synthesized'].float(), warped.float(), mask.float())
     
-    # Convert outputs to numpy BGR
     left_np = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
     
     warped_pil = to_pil_image(warped[0])
@@ -151,14 +154,6 @@ class FFmpegVideoWriter:
     """Wrapper for writing video using FFmpeg with H.264 codec."""
     
     def __init__(self, output_path, width, height, fps, crf=23, preset='medium'):
-        """
-        Args:
-            output_path: Output video file path (.mp4)
-            width, height: Frame dimensions
-            fps: Frames per second
-            crf: Quality (0-51, lower=better, 18-28 recommended)
-            preset: Encoding speed (ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow)
-        """
         self.output_path = output_path
         self.width = width
         self.height = height
@@ -233,9 +228,10 @@ def process_video(video_path, depth_video_path, output_dir, scale_factor=0.15, s
         crf: Quality (0-51, lower=better, 18-28 recommended)
         preset: Encoding speed (medium, fast, slow, etc.)
     """
-    # Check FFmpeg availability
     if use_ffmpeg and not check_ffmpeg_available():
-        print("⚠ Warning: FFmpeg not found. Install with: brew install ffmpeg")
+        print("⚠ Warning: FFmpeg not found. Install with:")
+        print("   - Windows: choco install ffmpeg  OR  download from https://ffmpeg.org")
+        print("   - macOS:   brew install ffmpeg")
         print("Falling back to OpenCV VideoWriter (lower quality).\n")
         use_ffmpeg = False
     
@@ -243,7 +239,6 @@ def process_video(video_path, depth_video_path, output_dir, scale_factor=0.15, s
     output_path = join(output_dir, base_name)
     os.makedirs(output_path, exist_ok=True)
     
-    # Open input video
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video: {video_path}")
@@ -255,7 +250,6 @@ def process_video(video_path, depth_video_path, output_dir, scale_factor=0.15, s
     
     print(f"📹 Input video: {width}x{height} @ {fps:.2f}fps, {total_frames} frames")
     
-    # Open depth video if provided
     depth_cap = None
     if depth_video_path:
         depth_cap = cv2.VideoCapture(depth_video_path)
@@ -265,7 +259,6 @@ def process_video(video_path, depth_video_path, output_dir, scale_factor=0.15, s
         if depth_total != total_frames:
             print(f"⚠ Warning: Depth video has {depth_total} frames, input has {total_frames}")
     
-    # Output video writers setup
     out_width, out_height = IMAGE_SIZE, IMAGE_SIZE
     output_fps = fps / skip_frames
     
@@ -278,7 +271,6 @@ def process_video(video_path, depth_video_path, output_dir, scale_factor=0.15, s
         }
         codec_info = f"H.264/libx264 (CRF={crf}, preset={preset})"
     else:
-        # Fallback to OpenCV with mp4v codec
         try:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         except:
@@ -314,7 +306,6 @@ def process_video(video_path, depth_video_path, output_dir, scale_factor=0.15, s
             if not ret:
                 break
             
-            # Read depth frame if provided
             if depth_cap:
                 ret_depth, depth_frame_bgr = depth_cap.read()
                 if not ret_depth:
@@ -327,7 +318,6 @@ def process_video(video_path, depth_video_path, output_dir, scale_factor=0.15, s
             else:
                 depth = infer_depth_dam2(frame_bgr)
             
-            # Process frame every skip_frames
             if frame_idx % skip_frames == 0:
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                 frame_pil = Image.fromarray(frame_rgb)
@@ -366,7 +356,7 @@ if __name__ == '__main__':
     parser.add_argument("--output", default="./vis", help="Output directory")
     parser.add_argument("--scale_factor", type=float, default=0.15, help="Disparity scaling factor")
     parser.add_argument("--skip_frames", type=int, default=1, help="Process every nth frame (default 1). Use >1 for faster processing.")
-    parser.add_argument("--use_ffmpeg", type=bool, default=True, help="Use FFmpeg for encoding (default True). Set to False to use OpenCV.")
+    parser.add_argument("--no_ffmpeg", action='store_true', help="Disable FFmpeg and use OpenCV for encoding instead.")
     parser.add_argument("--crf", type=int, default=23, help="H.264 quality (0-51, lower=better, 18-28 recommended)")
     parser.add_argument("--preset", default='medium', help="Encoding speed (ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow)")
     
@@ -378,7 +368,7 @@ if __name__ == '__main__':
         args.output,
         scale_factor=args.scale_factor,
         skip_frames=args.skip_frames,
-        use_ffmpeg=args.use_ffmpeg,
+        use_ffmpeg=not args.no_ffmpeg,
         crf=args.crf,
         preset=args.preset
     )

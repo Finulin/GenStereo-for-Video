@@ -1,3 +1,7 @@
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", module="diffusers")
+
 from os.path import basename, splitext, join
 import numpy as np
 import torch
@@ -60,7 +64,7 @@ genstereo_nvs = GenStereo(cfg=genstereo_cfg, device=DEVICE, sd_version=SD_VERSIO
 
 fusion_model = AdaptiveFusionLayer()
 fusion_checkpoint = join(checkpoint_dir, CHECKPOINT_NAME, 'fusion_layer.pth')
-fusion_model.load_state_dict(torch.load(fusion_checkpoint))
+fusion_model.load_state_dict(torch.load(fusion_checkpoint, map_location=DEVICE))
 fusion_model = fusion_model.to(DEVICE).eval()
 
 def crop(img: Image) -> Image:
@@ -88,7 +92,7 @@ def load_image_and_depth(image_path: str, depth_path: str):
     image = Image.open(image_path).convert('RGB')
     image = crop(image).resize((IMAGE_SIZE, IMAGE_SIZE), Image.BILINEAR)
     
-    depth_map = Image.open(depth_path).convert('L') # load as grayscale
+    depth_map = Image.open(depth_path).convert('L')
     depth_map = crop(depth_map).resize((IMAGE_SIZE, IMAGE_SIZE), Image.BILINEAR)
     
     depth_tensor = to_tensor(depth_map).unsqueeze(0).float().to(DEVICE)
