@@ -4,3 +4,6 @@ checkpoints/
 mlruns/
 vis/
 **/.DS_Store
+
+conda_pkgs/
+
