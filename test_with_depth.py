@@ -7,10 +7,7 @@ import numpy as np
 import torch
 import cv2
 from torchvision.transforms.functional import to_tensor, to_pil_image
-import ssl
 import os
-from extern.DAM2.depth_anything_v2.dpt import DepthAnythingV2
-ssl._create_default_https_context = ssl._create_unverified_context
 from PIL import Image
 import argparse
 
@@ -36,32 +33,7 @@ else:
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
 
-model_configs = {
-    'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
-    'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
-    'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
-}
-
-encoder = 'vitl'
-encoder_size_map = {'vits': 'Small', 'vitb': 'Base', 'vitl': 'Large'}
-
-if encoder not in encoder_size_map:
-    raise ValueError(f"Unsupported encoder: {encoder}. Supported: {list(encoder_size_map.keys())}")
-
-dam2 = DepthAnythingV2(**model_configs[encoder])
-size_name = encoder_size_map[encoder]
-dam2_path = f"https://huggingface.co/depth-anything/Depth-Anything-V2-{size_name}/resolve/main/depth_anything_v2_{encoder}.pth"
-
 checkpoint_dir = 'checkpoints'
-dam2_checkpoint = f'{checkpoint_dir}/depth_anything_v2_{encoder}.pth'
-os.makedirs(checkpoint_dir, exist_ok=True)
-
-if not os.path.exists(dam2_checkpoint):
-    print(f"Downloading DAM2 model from {dam2_path}")
-    os.system(f"wget {dam2_path} -O {dam2_checkpoint}")
-
-dam2.load_state_dict(torch.load(dam2_checkpoint, map_location='cpu'))
-dam2 = dam2.to(DEVICE).eval()
 
 genstereo_cfg = dict(
     pretrained_model_path=checkpoint_dir,
@@ -161,25 +133,6 @@ def upscale_image(img, scale=4):
     
     return output_pil
 
-def crop_to_square(img: Image) -> tuple:
-    """Crop image to square format. Returns (cropped_image, original_size)."""
-    W, H = img.size
-    if W < H:
-        crop_size = W
-        top = (H - crop_size) // 2
-        bottom = top + crop_size
-        left, right = 0, W
-    else:
-        crop_size = H
-        left = (W - crop_size) // 2
-        right = left + crop_size
-        top, bottom = 0, H
-    return img.crop((left, top, right, bottom)), (W, H)
-
-def resize_to_square(img: Image, size: int) -> Image:
-    """Resize image to square for model processing."""
-    return img.resize((size, size), Image.BILINEAR)
-
 def calculate_output_size(original_size: tuple, max_size: int) -> tuple:
     """Calculate output size keeping aspect ratio."""
     W, H = original_size
@@ -201,38 +154,17 @@ def calculate_output_size(original_size: tuple, max_size: int) -> tuple:
     
     return (new_width, new_height)
 
-def infer_depth_dam2(image_path: str, keep_aspect_ratio: bool = True):
-    """Load image and infer depth. Returns (processed_image, depth_tensor, original_size, output_size)."""
-    image = Image.open(image_path).convert('RGB')
-    original_size = image.size  # (W, H)
-    
-    if keep_aspect_ratio:
-        # For aspect ratio mode: resize to square for model, but remember original size
-        output_size = calculate_output_size(original_size, IMAGE_SIZE)
-        # Resize to square for model processing
-        square_image = resize_to_square(image, IMAGE_SIZE)
-    else:
-        # Crop to square
-        square_image, original_size = crop_to_square(image)
-        output_size = (IMAGE_SIZE, IMAGE_SIZE)
-    
-    image_bgr = cv2.cvtColor(np.array(square_image), cv2.COLOR_RGB2BGR)
-    depth_dam2 = dam2.infer_image(image_bgr)
-    
-    return square_image, torch.tensor(depth_dam2).unsqueeze(0).unsqueeze(0).float().to(DEVICE), original_size, output_size
-
-def load_image_and_depth(image_path: str, depth_path: str, keep_aspect_ratio: bool = True):
+def load_image_and_depth(image_path: str, depth_path: str):
     """Load image and depth map. Returns (processed_image, depth_tensor, original_size, output_size)."""
     image = Image.open(image_path).convert('RGB')
     original_size = image.size  # (W, H)
     
-    if keep_aspect_ratio:
-        output_size = calculate_output_size(original_size, IMAGE_SIZE)
-        square_image = resize_to_square(image, IMAGE_SIZE)
-    else:
-        square_image, original_size = crop_to_square(image)
-        output_size = (IMAGE_SIZE, IMAGE_SIZE)
+    output_size = calculate_output_size(original_size, IMAGE_SIZE)
     
+    # Resize to square for model processing
+    square_image = image.resize((IMAGE_SIZE, IMAGE_SIZE), Image.BILINEAR)
+    
+    # Load and resize depth map
     depth_map = Image.open(depth_path).convert('L')
     depth_map = depth_map.resize((IMAGE_SIZE, IMAGE_SIZE), Image.BILINEAR)
     
@@ -301,12 +233,11 @@ def generate_novel_view(image, depth, output_dir, basename, original_size, outpu
     return (out_w, out_h)
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Generate novel view from input image")
+    parser = argparse.ArgumentParser(description="Generate novel view from input image with depth map")
     parser.add_argument("image_path", help="Path to input image")
-    parser.add_argument("--depth_path", help="Path to input depth map. If not provided, it will be generated.", default=None)
+    parser.add_argument("depth_path", help="Path to depth map (grayscale image)")
     parser.add_argument("--output", default="./vis", help="Output directory")
     parser.add_argument("--scale_factor", type=float, default=0.05, help="Disparity scaling factor")
-    parser.add_argument("--crop", action='store_true', help="Crop to square instead of keeping aspect ratio")
     parser.add_argument("--save_all", action='store_true', help="Save all outputs (disp.png, warped.png) in addition to left.png and generated_right.png")
     parser.add_argument("--upscale", type=int, choices=[0, 2, 4], default=0, help="Upscale output images by factor (0=no upscaling, 2=2x, 4=4x). Requires: pip install basicsr realesrgan")
     args = parser.parse_args()
@@ -325,20 +256,14 @@ if __name__ == '__main__':
     print("")
     
     base_name = splitext(basename(args.image_path))[0]
-    keep_aspect = not args.crop
     
-    if args.depth_path:
-        print(f"Loading image from {args.image_path} and depth map from {args.depth_path}")
-        img, depth, orig_size, out_size = load_image_and_depth(args.image_path, args.depth_path, keep_aspect)
-    else:
-        print(f"Generating depth map from {args.image_path}")
-        img, depth, orig_size, out_size = infer_depth_dam2(args.image_path, keep_aspect)
+    print(f"Loading image from {args.image_path}")
+    print(f"Loading depth map from {args.depth_path}")
+    img, depth, orig_size, out_size = load_image_and_depth(args.image_path, args.depth_path)
     
-    aspect_mode = "original aspect ratio" if keep_aspect else "cropped to square"
     print(f"Original size: {orig_size[0]}x{orig_size[1]} px")
     print(f"Output width:  {out_size[0]} px")
     print(f"Output height: {out_size[1]} px")
-    print(f"Aspect mode:   {aspect_mode}")
     print(f"Scale factor:  {args.scale_factor}")
     print("")
     
