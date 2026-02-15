@@ -10,7 +10,5 @@ einops
 roma
 jaxtyping
 numpy<2  # Downgrade NumPy to avoid compatibility issues
-
-# Optional: Real-ESRGAN for upscaling (--upscale parameter)
 basicsr
 realesrgan

@@ -32,10 +32,10 @@ sudo apt install ffmpeg
 pip install -r requirements.txt
 ```
 
-### Optional: Real-ESRGAN für Upscaling
+### Models
 
 ```bash
-pip install basicsr realesrgan
+./scripts/download_models.sh
 ```
 
 > **Hinweis:** Bei Kompatibilitätsproblemen mit `torchvision`:

@@ -51,10 +51,3 @@ download \
     fusion_layer.pth \
     pose_guider.pth \
     reference_unet.pth
-
-# Additional file download using wget to the ckpt_dir
-depth_anything_file="${ckpt_dir}/depth_anything_v2_vitl.pth"
-depth_anything_url="https://huggingface.co/depth-anything/Depth-Anything-V2-Large/resolve/main/depth_anything_v2_vitl.pth"
-
-echo "Downloading ${depth_anything_file}..."
-wget -q "${depth_anything_url}" -O "${depth_anything_file}"
